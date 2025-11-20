@@ -116,9 +116,22 @@ static inline void tcp_close_connection(uint8_t remote_ip[NET_IP_LEN], uint16_t 
  * @param flags     TCP 标志位
  */
 void tcp_out(tcp_conn_t *tcp_conn, buf_t *buf, uint16_t src_port, uint8_t *dst_ip, uint16_t dst_port, uint8_t flags) {
-    /* =============================== TODO 1 BEGIN =============================== */
+    buf_add_header(buf, sizeof(tcp_hdr_t));
+    tcp_hdr_t *tcp_hdr = (tcp_hdr_t *)buf->data;
+    tcp_hdr->src_port16 = swap16(src_port);
+    tcp_hdr->dst_port16 = swap16(dst_port);
+    tcp_hdr->uptr = 0;
+    tcp_hdr->win = swap16(TCP_MAX_WINDOW_SIZE);
+    tcp_hdr->doff = ((TCP_HEADER_LEN / 4) << 4) | 0;
+    tcp_hdr->seq = swap32(tcp_conn->seq);
+    tcp_hdr->ack = swap32(tcp_conn->ack);
+    tcp_hdr->flags = flags;
 
-    /* =============================== TODO 1 END =============================== */
+    // 注意：全部数据填完后再计算校验和
+    tcp_hdr->checksum16 = 0;
+    uint16_t checksum16 = transport_checksum(NET_PROTOCOL_TCP, buf, net_if_ip, dst_ip);
+    tcp_hdr->checksum16 = checksum16;
+    ip_out(buf, dst_ip, NET_PROTOCOL_TCP);
 }
 
 /**
@@ -164,23 +177,20 @@ void tcp_in(buf_t *buf, uint8_t *src_ip) {
      // 根据当前 TCP 连接的状态进行不同的处理    
     switch (tcp_conn->state) {
         case TCP_STATE_LISTEN:
-            // TODO: 仅在收到连接报文时（SYN报文）才做出处理，否则直接返回
-
-            // TODO: 初始化 TCP 连接上下文（tcp_conn结构体）的seq字段
-
-            // TODO: 填写 TCP 连接上下文（tcp_conn结构体）的ack字段
-
-            // TODO: 填写回复标志 send_flags
-
-            // TODO: 进行状态转移
-
+            if (!TCP_FLG_ISSET(recv_flags, TCP_FLG_SYN)) {
+                return;
+            }
+            tcp_conn->seq = tcp_generate_initial_seq();
+            tcp_conn->ack = remote_seq + 1;
+            send_flags = TCP_FLG_SYN | TCP_FLG_ACK;
+            tcp_conn->state = TCP_STATE_SYN_RECEIVED;
             break;
 
         case TCP_STATE_SYN_RECEIVED:
-            // TODO: 仅在收到确认报文时（ACK报文）才做出处理，否则直接返回
-
-            // TODO: 进行状态转移
-
+            if (!TCP_FLG_ISSET(recv_flags, TCP_FLG_ACK)){
+                return;
+            }
+            tcp_conn->state = TCP_STATE_ESTABLISHED;
             break;
 
         case TCP_STATE_ESTABLISHED:
@@ -190,19 +200,29 @@ void tcp_in(buf_t *buf, uint8_t *src_ip) {
                 tcp_out(tcp_conn, &txbuf, host_port, remote_ip, remote_port, TCP_FLG_ACK);
                 return;
             }
-            // TODO: 计算接收到的数据长度，更新 ACK
+            
+            size_t recv_data_len = buf->len - tcp_hdr_sz;
+            tcp_conn->ack += bytes_in_flight(recv_data_len, recv_flags);
 
             // TODO: 如果接收报文携带数据，则填写回复标志 send_flags 发送ACK
+            if (recv_data_len > 0){
+                send_flags |= TCP_FLG_ACK;
+            }
 
             // TODO: 如果收到 FIN 报文，则增加 send_flags 相应标志位，并且进行状态转移
+            if (TCP_FLG_ISSET(recv_flags, TCP_FLG_FIN)){
+                send_flags |= TCP_FLG_FIN;
+                tcp_conn->state = TCP_STATE_LAST_ACK;
+            }
 
             break;
 
         case TCP_STATE_LAST_ACK:
-            // TODO: 仅在收到确认报文时（ACK报文）才做出处理，否则直接返回
-
-            // TODO: 关闭 TCP 连接
-
+            if (!TCP_FLG_ISSET(recv_flags, TCP_FLG_ACK)){
+                return;
+            }
+            tcp_conn->state = TCP_STATE_CLOSED;
+            tcp_close_connection(remote_ip, remote_port, host_port);
             break;
 
         default:
@@ -212,6 +232,13 @@ void tcp_in(buf_t *buf, uint8_t *src_ip) {
 
     /* Step2 ：如果接收报文携带数据，则将数据部分交付给上层应用 */
     // TODO
+    if (buf->len > tcp_hdr_sz){
+        tcp_handler_t* tcp_handler_func = map_get(&tcp_handler_table,&host_port);
+        buf_remove_header(buf, tcp_hdr_sz);
+        if (tcp_handler_func){
+            (*tcp_handler_func)(tcp_conn, buf->data, buf->len, remote_ip, remote_port);
+        }
+    }
 
 
     /* Step3 ：调用tcp_out()发送回复报文，更新TCP连接序列号。 */
@@ -226,8 +253,12 @@ void tcp_in(buf_t *buf, uint8_t *src_ip) {
     }
 
     // TODO:  初始化一个新的缓冲区，发送回复报文
+    buf_t tcp_send_buf;
+    buf_init(&tcp_send_buf, 0); // 注意这里要初始化为0，因为在tcp_out中会add_header
+    tcp_out(tcp_conn, &tcp_send_buf, host_port, remote_ip, remote_port, send_flags);
 
     // TODO: 更新序列号
+    tcp_conn->seq++;
 
     /* =============================== TODO 2 END =============================== */
 }
